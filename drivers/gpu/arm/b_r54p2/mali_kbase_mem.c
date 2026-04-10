@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
 /*
  *
- * (C) COPYRIGHT 2010-2022 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2010-2023 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -380,6 +380,7 @@ void kbase_remove_va_region(struct kbase_device *kbdev,
 	struct rb_node *rbnext;
 	struct kbase_va_region *next = NULL;
 	struct rb_root *reg_rbtree = NULL;
+	struct kbase_va_region *orig_reg = reg;
 
 	int merged_front = 0;
 	int merged_back = 0;
@@ -476,6 +477,12 @@ void kbase_remove_va_region(struct kbase_device *kbdev,
 		}
 		rb_replace_node(&(reg->rblink), &(free_reg->rblink), reg_rbtree);
 	}
+
+	/* This operation is always safe because the function never frees
+	 * the region. If the region has been merged to both front and back,
+	 * then it's the previous region that is supposed to be freed.
+	 */
+	orig_reg->start_pfn = 0;
 
 out:
 	return;
@@ -827,6 +834,10 @@ static void kbase_region_tracker_erase_rbtree(struct rb_root *rbtree)
 
 void kbase_region_tracker_term(struct kbase_context *kctx)
 {
+	WARN(kctx->as_nr != KBASEP_AS_NR_INVALID,
+	     "kctx-%d_%d must first be scheduled out to flush GPU caches+tlbs before erasing remaining regions",
+	     kctx->tgid, kctx->id);
+
 	kbase_gpu_vm_lock(kctx);
 	kbase_region_tracker_erase_rbtree(&kctx->reg_rbtree_same);
 	kbase_region_tracker_erase_rbtree(&kctx->reg_rbtree_custom);
@@ -1746,7 +1757,7 @@ int kbase_gpu_mmap(struct kbase_context *kctx, struct kbase_va_region *reg,
 					reg->flags & gwt_mask, kctx->as_nr,
 					group_id, mmu_sync_info);
 				if (err)
-					goto bad_insert;
+					goto bad_aliased_insert;
 
 				/* Note: mapping count is tracked at alias
 				 * creation time
@@ -1760,7 +1771,7 @@ int kbase_gpu_mmap(struct kbase_context *kctx, struct kbase_va_region *reg,
 					group_id, mmu_sync_info);
 
 				if (err)
-					goto bad_insert;
+					goto bad_aliased_insert;
 			}
 		}
 	} else {
@@ -1801,9 +1812,16 @@ int kbase_gpu_mmap(struct kbase_context *kctx, struct kbase_va_region *reg,
 
 	return err;
 
+bad_aliased_insert:
+       while (i-- > 0) {
+
+                kbase_mmu_teardown_pages(kctx->kbdev, &kctx->mmu, reg->start_pfn, alloc->pages,
+                                 reg->nr_pages, kctx->as_nr);
+
+       }
+
+
 bad_insert:
-	kbase_mmu_teardown_pages(kctx->kbdev, &kctx->mmu, reg->start_pfn, alloc->pages,
-				 reg->nr_pages, kctx->as_nr);
 
 	kbase_remove_va_region(kctx->kbdev, reg);
 
@@ -1840,16 +1858,21 @@ int kbase_gpu_munmap(struct kbase_context *kctx, struct kbase_va_region *reg)
 			 * separately.
 			 */
 			for (i = 0; i < alloc->imported.alias.nents; i++) {
-				if (alloc->imported.alias.aliased[i].alloc) {
-					int err_loop = kbase_mmu_teardown_pages(
-						kctx->kbdev, &kctx->mmu,
-						reg->start_pfn + (i * alloc->imported.alias.stride),
-						alloc->pages + (i * alloc->imported.alias.stride),
-						alloc->imported.alias.aliased[i].length,
-						kctx->as_nr);
-					if (WARN_ON_ONCE(err_loop))
-						err = err_loop;
-				}
+				struct tagged_addr *phys_alloc = NULL;
+				int err_loop;
+
+				if (alloc->imported.alias.aliased[i].alloc != NULL)
+					phys_alloc = alloc->imported.alias.aliased[i].alloc->pages +
+						     alloc->imported.alias.aliased[i].offset;
+
+				err_loop = kbase_mmu_teardown_pages(
+					kctx->kbdev, &kctx->mmu,
+					reg->start_pfn + (i * alloc->imported.alias.stride),
+					phys_alloc, alloc->imported.alias.aliased[i].length,
+					kctx->as_nr);
+
+				if (WARN_ON_ONCE(err_loop))
+					err = err_loop;
 			}
 		}
 		break;
@@ -2031,6 +2054,7 @@ void kbase_sync_single(struct kbase_context *kctx,
 			src = ((unsigned char *)kmap(gpu_page)) + offset;
 			dst = ((unsigned char *)kmap(cpu_page)) + offset;
 		}
+
 		memcpy(dst, src, size);
 		kunmap(gpu_page);
 		kunmap(cpu_page);
@@ -2186,6 +2210,27 @@ int kbase_mem_free_region(struct kbase_context *kctx, struct kbase_va_region *re
 	if (reg->flags & KBASE_REG_NO_USER_FREE) {
 		dev_warn(kctx->kbdev->dev, "Attempt to free GPU memory whose freeing by user space is forbidden!\n");
 		return -EINVAL;
+	}
+
+	/* If a region has been made evictable then we must unmake it
+	 * before trying to free it.
+	 * If the memory hasn't been reclaimed it will be unmapped and freed
+	 * below, if it has been reclaimed then the operations below are no-ops.
+	 */
+
+	if (reg->flags & KBASE_REG_DONT_NEED) {
+		WARN_ON(reg->cpu_alloc->type != KBASE_MEM_TYPE_NATIVE);
+		mutex_lock(&kctx->jit_evict_lock);
+		/* Unlink the physical allocation before unmaking it evictable so
+		 * that the allocation isn't grown back to its last backed size
+		 * as we're going to unmap it anyway.
+		 */
+
+		reg->cpu_alloc->reg = NULL;
+		if (reg->cpu_alloc != reg->gpu_alloc)
+			reg->gpu_alloc->reg = NULL;
+		mutex_unlock(&kctx->jit_evict_lock);
+		kbase_mem_evictable_unmake(reg->gpu_alloc);
 	}
 
 	err = kbase_gpu_munmap(kctx, reg);
@@ -2447,7 +2492,7 @@ int kbase_alloc_phy_pages_helper(struct kbase_mem_phy_alloc *alloc,
 			&kctx->mem_pools.large[alloc->group_id],
 			 nr_lp * (SZ_2M / SZ_4K),
 			 tp,
-			 true);
+			 true, kctx->task);
 
 		if (res > 0) {
 			nr_left -= res;
@@ -2501,7 +2546,7 @@ int kbase_alloc_phy_pages_helper(struct kbase_mem_phy_alloc *alloc,
 
 				err = kbase_mem_pool_grow(
 					&kctx->mem_pools.large[alloc->group_id],
-					1);
+					1, kctx->task);
 				if (err)
 					break;
 			} while (1);
@@ -2548,7 +2593,7 @@ no_new_partial:
 	if (nr_left) {
 		res = kbase_mem_pool_alloc_pages(
 			&kctx->mem_pools.small[alloc->group_id],
-			nr_left, tp, false);
+			nr_left, tp, false, kctx->task);
 		if (res <= 0)
 			goto alloc_failed;
 	}
@@ -4038,7 +4083,7 @@ static int kbase_jit_grow(struct kbase_context *kctx,
 		spin_unlock(&kctx->mem_partials_lock);
 
 		kbase_gpu_vm_unlock(kctx);
-		ret = kbase_mem_pool_grow(pool, pool_delta);
+		ret = kbase_mem_pool_grow(pool, pool_delta, kctx->task);
 		kbase_gpu_vm_lock(kctx);
 
 		if (ret)
@@ -4594,6 +4639,7 @@ bool kbase_jit_evict(struct kbase_context *kctx)
 		reg = list_entry(kctx->jit_pool_head.prev,
 				struct kbase_va_region, jit_node);
 		list_del(&reg->jit_node);
+		list_del_init(&reg->gpu_alloc->evict_node);
 	}
 	mutex_unlock(&kctx->jit_evict_lock);
 
@@ -4618,12 +4664,10 @@ void kbase_jit_term(struct kbase_context *kctx)
 		walker = list_first_entry(&kctx->jit_pool_head,
 				struct kbase_va_region, jit_node);
 		list_del(&walker->jit_node);
+		list_del_init(&walker->gpu_alloc->evict_node);
 		mutex_unlock(&kctx->jit_evict_lock);
-		/* As context is terminating, directly free the backing pages
-		 * without unmapping them from the GPU as done in
-		 * kbase_region_tracker_erase_rbtree().
-		 */
-		kbase_free_alloced_region(walker);
+		walker->flags &= ~KBASE_REG_NO_USER_FREE;
+		kbase_mem_free_region(kctx, walker);
 		mutex_lock(&kctx->jit_evict_lock);
 	}
 
@@ -4632,8 +4676,10 @@ void kbase_jit_term(struct kbase_context *kctx)
 		walker = list_first_entry(&kctx->jit_active_head,
 				struct kbase_va_region, jit_node);
 		list_del(&walker->jit_node);
+		list_del_init(&walker->gpu_alloc->evict_node);
 		mutex_unlock(&kctx->jit_evict_lock);
-		kbase_free_alloced_region(walker);
+		walker->flags &= ~KBASE_REG_NO_USER_FREE;
+		kbase_mem_free_region(kctx, walker);
 		mutex_lock(&kctx->jit_evict_lock);
 	}
 #if MALI_JIT_PRESSURE_LIMIT_BASE
@@ -4841,10 +4887,7 @@ static int kbase_jd_user_buf_map(struct kbase_context *kctx,
 	struct page **pages;
 	struct tagged_addr *pa;
 	long i, dma_mapped_pages;
-	unsigned long address;
 	struct device *dev;
-	unsigned long offset_within_page;
-	unsigned long remaining_size;
 	unsigned long gwt_mask = ~0;
 	/* Calls to this function are inherently asynchronous, with respect to
 	 * MMU operations.
@@ -4860,20 +4903,34 @@ static int kbase_jd_user_buf_map(struct kbase_context *kctx,
 
 	alloc = reg->gpu_alloc;
 	pa = kbase_get_gpu_phy_pages(reg);
-	address = alloc->imported.user_buf.address;
 	pinned_pages = alloc->nents;
 	pages = alloc->imported.user_buf.pages;
 	dev = kctx->kbdev->dev;
-	offset_within_page = address & ~PAGE_MASK;
-	remaining_size = alloc->imported.user_buf.size;
 
+	/* Manual CPU cache synchronization.
+	 *
+	 * The driver disables automatic CPU cache synchronization because the
+	 * memory pages that enclose the imported region may also contain
+	 * sub-regions which are not imported and that are allocated and used
+	 * by the user process. This may be the case of memory at the beginning
+	 * of the first page and at the end of the last page. Automatic CPU cache
+	 * synchronization would force some operations on those memory allocations,
+	 * unbeknown to the user process: in particular, a CPU cache invalidate
+	 * upon unmapping would destroy the content of dirty CPU caches and cause
+	 * the user process to lose CPU writes to the non-imported sub-regions.
+	 *
+	 * When the GPU claims ownership of the imported memory buffer, it shall
+	 * commit CPU writes for the whole of all pages that enclose the imported
+	 * region, otherwise the initial content of memory would be wrong.
+	 */
 	for (i = 0; i < pinned_pages; i++) {
-		unsigned long map_size =
-			MIN(PAGE_SIZE - offset_within_page, remaining_size);
-		dma_addr_t dma_addr = dma_map_page(dev, pages[i],
-				offset_within_page, map_size,
-				DMA_BIDIRECTIONAL);
-
+		dma_addr_t dma_addr;
+#if (KERNEL_VERSION(4, 10, 0) > LINUX_VERSION_CODE)
+		dma_addr = dma_map_page(dev, pages[i], 0, PAGE_SIZE, DMA_BIDIRECTIONAL);
+#else
+		dma_addr = dma_map_page_attrs(dev, pages[i], 0, PAGE_SIZE, DMA_BIDIRECTIONAL,
+					      DMA_ATTR_SKIP_CPU_SYNC);
+#endif
 		err = dma_mapping_error(dev, dma_addr);
 		if (err)
 			goto unwind;
@@ -4881,8 +4938,7 @@ static int kbase_jd_user_buf_map(struct kbase_context *kctx,
 		alloc->imported.user_buf.dma_addrs[i] = dma_addr;
 		pa[i] = as_tagged(page_to_phys(pages[i]));
 
-		remaining_size -= map_size;
-		offset_within_page = 0;
+		dma_sync_single_for_device(dev, dma_addr, PAGE_SIZE, DMA_BIDIRECTIONAL);
 	}
 
 #ifdef CONFIG_MALI_CINSTR_GWT
@@ -4900,19 +4956,26 @@ static int kbase_jd_user_buf_map(struct kbase_context *kctx,
 	/* fall down */
 unwind:
 	alloc->nents = 0;
-	offset_within_page = address & ~PAGE_MASK;
-	remaining_size = alloc->imported.user_buf.size;
 	dma_mapped_pages = i;
-	/* Run the unmap loop in the same order as map loop */
+	/* Run the unmap loop in the same order as map loop, and perform again
+	 * CPU cache synchronization to re-write the content of dirty CPU caches
+	 * to memory. This is precautionary measure in case a GPU job has taken
+	 * advantage of a partially GPU-mapped range to write and corrupt the
+	 * content of memory, either inside or outside the imported region.
+	 *
+	 * Notice that this error recovery path doesn't try to be optimal and just
+	 * flushes the entire page range.
+	 */
 	for (i = 0; i < dma_mapped_pages; i++) {
-		unsigned long unmap_size =
-			MIN(PAGE_SIZE - offset_within_page, remaining_size);
+		dma_addr_t dma_addr = alloc->imported.user_buf.dma_addrs[i];
 
-		dma_unmap_page(kctx->kbdev->dev,
-				alloc->imported.user_buf.dma_addrs[i],
-				unmap_size, DMA_BIDIRECTIONAL);
-		remaining_size -= unmap_size;
-		offset_within_page = 0;
+		dma_sync_single_for_device(dev, dma_addr, PAGE_SIZE, DMA_BIDIRECTIONAL);
+#if (KERNEL_VERSION(4, 10, 0) > LINUX_VERSION_CODE)
+		dma_unmap_page(dev, dma_addr, PAGE_SIZE, DMA_BIDIRECTIONAL);
+#else
+		dma_unmap_page_attrs(dev, dma_addr, PAGE_SIZE, DMA_BIDIRECTIONAL,
+				     DMA_ATTR_SKIP_CPU_SYNC);
+#endif
 	}
 
 	/* The user buffer could already have been previously pinned before
@@ -4953,12 +5016,89 @@ static void kbase_jd_user_buf_unmap(struct kbase_context *kctx, struct kbase_mem
 #endif
 
 	for (i = 0; i < alloc->imported.user_buf.nr_pages; i++) {
-		unsigned long unmap_size =
-			MIN(remaining_size, PAGE_SIZE - offset_within_page);
+		unsigned long imported_size = MIN(remaining_size, PAGE_SIZE - offset_within_page);
+		/* Notice: this is a temporary variable that is used for DMA sync
+		 * operations, and that could be incremented by an offset if the
+		 * current page contains both imported and non-imported memory
+		 * sub-regions.
+		 *
+		 * It is valid to add an offset to this value, because the offset
+		 * is always kept within the physically contiguous dma-mapped range
+		 * and there's no need to translate to physical address to offset it.
+		 *
+		 * This variable is not going to be used for the actual DMA unmap
+		 * operation, that shall always use the original DMA address of the
+		 * whole memory page.
+		 */
 		dma_addr_t dma_addr = alloc->imported.user_buf.dma_addrs[i];
 
-		dma_unmap_page(kctx->kbdev->dev, dma_addr, unmap_size,
-				DMA_BIDIRECTIONAL);
+		/* Manual CPU cache synchronization.
+		 *
+		 * When the GPU returns ownership of the buffer to the CPU, the driver
+		 * needs to treat imported and non-imported memory differently.
+		 *
+		 * The first case to consider is non-imported sub-regions at the
+		 * beginning of the first page and at the end of last page. For these
+		 * sub-regions: CPU cache shall be committed with a clean+invalidate,
+		 * in order to keep the last CPU write.
+		 *
+		 * Imported region prefers the opposite treatment: this memory has been
+		 * legitimately mapped and used by the GPU, hence GPU writes shall be
+		 * committed to memory, while CPU cache shall be invalidated to make
+		 * sure that CPU reads the correct memory content.
+		 *
+		 * The following diagram shows the expect value of the variables
+		 * used in this loop in the corner case of an imported region encloed
+		 * by a single memory page:
+		 *
+		 * page boundary ->|---------- | <- dma_addr (initial value)
+		 *                 |           |
+		 *                 | - - - - - | <- offset_within_page
+		 *                 |XXXXXXXXXXX|\
+		 *                 |XXXXXXXXXXX| \
+		 *                 |XXXXXXXXXXX|  }- imported_size
+		 *                 |XXXXXXXXXXX| /
+		 *                 |XXXXXXXXXXX|/
+		 *                 | - - - - - | <- offset_within_page + imported_size
+		 *                 |           |\
+		 *                 |           | }- PAGE_SIZE - imported_size - offset_within_page
+		 *                 |           |/
+		 * page boundary ->|-----------|
+		 *
+		 * If the imported region is enclosed by more than one page, then
+		 * offset_within_page = 0 for any page after the first.
+		 */
+
+		/* Only for first page: handle non-imported range at the beginning. */
+		if (offset_within_page > 0) {
+			dma_sync_single_for_device(kctx->kbdev->dev, dma_addr, offset_within_page,
+						   DMA_BIDIRECTIONAL);
+			dma_addr += offset_within_page;
+		}
+
+		/* For every page: handle imported range. */
+		if (imported_size > 0)
+			dma_sync_single_for_cpu(kctx->kbdev->dev, dma_addr, imported_size,
+						DMA_BIDIRECTIONAL);
+
+		/* Only for last page (that may coincide with first page):
+		 * handle non-imported range at the end.
+		 */
+		if ((imported_size + offset_within_page) < PAGE_SIZE) {
+			dma_addr += imported_size;
+			dma_sync_single_for_device(kctx->kbdev->dev, dma_addr,
+						   PAGE_SIZE - imported_size - offset_within_page,
+						   DMA_BIDIRECTIONAL);
+		}
+
+		/* Notice: use the original DMA address to unmap the whole memory page. */
+#if (KERNEL_VERSION(4, 10, 0) > LINUX_VERSION_CODE)
+		dma_unmap_page(kctx->kbdev->dev, alloc->imported.user_buf.dma_addrs[i], PAGE_SIZE,
+			       DMA_BIDIRECTIONAL);
+#else
+		dma_unmap_page_attrs(kctx->kbdev->dev, alloc->imported.user_buf.dma_addrs[i],
+				     PAGE_SIZE, DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+#endif
 		if (writeable)
 			set_page_dirty_lock(pages[i]);
 #if !MALI_USE_CSF
@@ -4966,7 +5106,7 @@ static void kbase_jd_user_buf_unmap(struct kbase_context *kctx, struct kbase_mem
 		pages[i] = NULL;
 #endif
 
-		remaining_size -= unmap_size;
+		remaining_size -= imported_size;
 		offset_within_page = 0;
 	}
 #if !MALI_USE_CSF
